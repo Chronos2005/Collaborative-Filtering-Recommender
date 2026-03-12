@@ -8,11 +8,10 @@ logger.info('logger initialised')
 
 
 # Hyperparameters
-KNN_NEIGHBORS      = 40     # number of most-similar neighbours used per prediction
-SHRINKAGE_LAMBDA   = 10     # Bayesian shrinkage: n_ij / (n_ij + lambda)
-SIM_AMPLIFICATION  = 1.4    # case amplification exponent applied to similarities
-BIAS_REG           = 0.5    # L2 regularisation penalty for ALS bias learning
-ALS_ITERATIONS     = 15     # convergence iterations for Alternating Least Squares
+KNN_NEIGHBORS      = 60     # number of most-similar neighbours used per prediction
+SHRINKAGE_LAMBDA   = 5      # Bayesian shrinkage: n_ij / (n_ij + lambda)
+SIG_WEIGHT_THRESH  = 0      # significance weighting threshold: min(n_ij / T, 1); 0 = disabled
+SIM_AMPLIFICATION  = 1.6    # case amplification exponent applied to similarities
 SIM_DENOM_REG      = 0.05   # small constant added to prediction denominator to damp noise
 MIN_RATING         = 1.0    # minimum allowed predicted rating (ratings are {1,2,3,4,5})
 MAX_RATING         = 5.0    # maximum allowed predicted rating
@@ -41,48 +40,44 @@ def load_data( filepath=None ):
 
 
 def train_model( train_data=None, n_users=None, n_items=None,
-                 shrinkage_lambda=SHRINKAGE_LAMBDA, bias_reg=BIAS_REG ):
+                 shrinkage_lambda=SHRINKAGE_LAMBDA, sig_weight_thresh=SIG_WEIGHT_THRESH ):
     """
-    Build an item-item similarity model combining several techniques:
+    Build an item-item similarity model using adjusted cosine similarity.
 
-    1.  ALS Bias Learning
-        Learn user biases b_u and item biases b_i by minimising a regularised
-        squared-error objective via Alternating Least Squares:
+    1.  Baseline Bias Model
+        Compute user and item biases as simple deviations from global mean:
+            b_u = mean(r_u) - mu   (user bias: harsh vs generous rater)
+            b_i = mean(r_i) - mu   (item bias: popular vs unpopular item)
+        
+        Baseline prediction: b_ui = mu + b_u + b_i
 
-            L = sum_{(u,i)} (r_ui - mu - b_u - b_i)^2  +  reg * (sum b_u^2 + sum b_i^2)
+    2.  Standard Adjusted Cosine Similarity (vectorised)
+        Ratings are centered by user mean:
 
-        ALS alternates between fixing one set of biases and solving for the other
-        in closed form.  After convergence the baseline prediction for (u, i) is:
+            z_ui = r_ui - mean_u
 
-            b_ui = mu + b_u + b_i
-
-    2.  ALS-Residual Centering
-        The residual z_ui = r_ui - b_ui captures how much each rating deviates
-        from the global + user + item baseline.  The similarity matrix is computed
-        on these residuals (not raw user-mean centered ratings) so that the
-        similarity space is consistent with the deviation space used in prediction.
-
-    3.  Inverse User Frequency (IUF) weighting
-        Before computing dot products, each item column of the centered matrix is
-        scaled by IUF_j = log( |U| / |U_j| ), where |U_j| is the number of users
-        who rated item j.  This down-weights universally popular items whose high
-        co-occurrence would otherwise inflate similarity scores.
-
-    4.  Adjusted Cosine Similarity (vectorised)
-        sim(i, j)  =  (z_i^T * z_j)  /  (||z_i|| * ||z_j||)
+        sim(i, j)  =  sum_u [z_ui * z_uj]
+                      ----------------------
+                        ||z_i|| * ||z_j||
 
         Computed for all item pairs simultaneously using matrix multiplication:
-            numerator   = Z_iuf^T  @  Z_iuf
+            numerator   = Z^T @ Z
             denominator = outer product of per-column L2 norms
 
-    5.  Empirical Bayes Shrinkage
+    3.  Empirical Bayes Shrinkage
         sim_adj(i, j) = sim(i, j) * n_ij / (n_ij + lambda)
 
         where n_ij = number of users who co-rated items i and j.
         This smoothly discounts similarity estimates based on few co-raters,
         unlike a hard threshold which creates a discontinuity.
 
-    Returns: (user_biases, similarity_matrix, item_biases, global_mean)
+    4.  Significance Weighting
+        sim'(i, j) = sim(i, j) * min(n_ij / T, 1)
+
+        where T = threshold (e.g., 50). Linearly penalises similarities
+        based on fewer than T co-raters, reaching full weight at T.
+
+    Returns: (user_biases, item_biases, similarity_matrix, global_mean)
     """
     # Infer dimensions from data if not provided (needed for cross-validation consistency)
     if n_users is None:
@@ -106,78 +101,81 @@ def train_model( train_data=None, n_users=None, n_items=None,
 
     logger.info( f'Global mean rating: {global_mean:.4f}' )
 
-    # ---- ALS Bias Optimisation ----
-    # Alternating closed-form updates:
-    #   b_i = sum_u [ (r_ui - mu - b_u) * I(rated) ] / (n_i + reg)
-    #   b_u = sum_i [ (r_ui - mu - b_i) * I(rated) ] / (n_u + reg)
-    user_biases = np.zeros( n_users, dtype=np.float64 )
-    item_biases = np.zeros( n_items, dtype=np.float64 )
+    # ---- Baseline Bias Model ----
+    # User bias: b_u = mean(r_u) - mu  (how much user deviates from global mean)
+    user_means = np.where( counts_per_user > 0, 
+                           rating_matrix.sum( axis=1 ) / np.maximum( counts_per_user, 1 ), 
+                           global_mean )
+    user_biases = user_means - global_mean
 
-    for _ in range( ALS_ITERATIONS ):
-        residual = (rating_matrix - global_mean - user_biases[:, np.newaxis]) * has_rating
-        item_biases = residual.sum( axis=0 ) / (counts_per_item + bias_reg)
+    # Item bias: b_i = mean(r_i) - mu  (how much item deviates from global mean)
+    item_means = np.where( counts_per_item > 0,
+                           rating_matrix.sum( axis=0 ) / np.maximum( counts_per_item, 1 ),
+                           global_mean )
+    item_biases = item_means - global_mean
 
-        residual = (rating_matrix - global_mean - item_biases[np.newaxis, :]) * has_rating
-        user_biases = residual.sum( axis=1 ) / (counts_per_user + bias_reg)
-
-    logger.info( f'ALS biases converged after {ALS_ITERATIONS} iterations' )
-
-    # ---- ALS-Residual Centering ----
-    # z_ui = r_ui - (mu + b_u + b_i)  for rated entries, 0 otherwise
-    baseline_matrix = global_mean + user_biases[:, np.newaxis] + item_biases[np.newaxis, :]
-    centered = np.where( has_rating > 0, rating_matrix - baseline_matrix, 0.0 )
-
-    # ---- Inverse User Frequency (IUF) Weighting ----
-    # IUF_j = log( n_users / count_j )  — penalises items rated by many users
-    counts_per_item_safe = np.maximum( counts_per_item, 1.0 )
-    iuf = np.log( n_users / counts_per_item_safe )
-    centered_iuf = centered * iuf[np.newaxis, :]
+    # ---- Standard Adjusted Cosine Similarity ----
+    # Center ratings by user mean: z_ui = r_ui - mean_u  for rated entries, 0 otherwise
+    centered = np.where( has_rating > 0, rating_matrix - user_means[:, np.newaxis], 0.0 )
 
     # ---- Vectorised Adjusted Cosine Similarity ----
+    # sim(i, j) = sum_u[z_ui * z_uj] / (||z_i|| * ||z_j||)
     logger.info( 'Computing similarity matrix...' )
     with np.errstate( all='ignore' ):
         co_rater_counts = has_rating.T @ has_rating
-        numerator = centered_iuf.T @ centered_iuf
-    norms = np.linalg.norm( centered_iuf, axis=0 )
+        numerator = centered.T @ centered
+    norms = np.linalg.norm( centered, axis=0 )
     norms[norms == 0] = 1e-10
     similarity_matrix = numerator / np.outer( norms, norms )
     np.nan_to_num( similarity_matrix, copy=False, nan=0.0, posinf=0.0, neginf=0.0 )
 
     # ---- Empirical Bayes Shrinkage ----
     similarity_matrix *= co_rater_counts / (co_rater_counts + shrinkage_lambda)
+
+    # ---- Significance Weighting ----
+    # sim'(i,j) = sim(i,j) * min(n_ij / T, 1)  — linearly penalise if < T co-raters
+    if sig_weight_thresh > 0:
+        sig_weight = np.minimum( co_rater_counts / sig_weight_thresh, 1.0 )
+        similarity_matrix *= sig_weight
+
     np.fill_diagonal( similarity_matrix, 0.0 )
 
     logger.info( f'Similarity matrix ready: {similarity_matrix.shape}' )
-    return user_biases, similarity_matrix, item_biases, global_mean
+    return user_biases, item_biases, similarity_matrix, global_mean
 
 
 def predict_ratings( test_data=None, similarity_matrix=None, user_biases=None,
-                     train_data=None, n_users=None, n_items=None,
-                     item_biases=None, global_mean=None,
+                     item_biases=None, train_data=None, n_users=None, n_items=None,
+                     global_mean=None,
                      knn_neighbors=KNN_NEIGHBORS, sim_amplification=SIM_AMPLIFICATION ):
     """
-    Predict ratings using baseline-integrated k-nearest-neighbour (KNN):
+    Predict ratings using k-nearest-neighbour (KNN) with baseline bias model:
 
-        pred(u, i) = b_ui  +  sum_j [ w_j * (r_uj - b_uj) ]
-                              -----------------------------------
-                              sum_j |w_j|  +  c
+        pred(u, i) = mu + b_u + b_i  +  sum_j [ w_j * (r_uj - (mu + b_u + b_j)) ]
+                                        -----------------------------------------
+                                        sum_j |w_j|  +  c
 
     where:
-        b_ui = mu + b_u + b_i                (ALS-learned baseline for user u, item i)
+        mu                                   (global mean rating)
+        b_u                                  (user bias: harsh vs generous rater)
+        b_i                                  (item bias: popular vs unpopular item)
         w_j  = sign(s_ij) * |s_ij|^p         (case-amplified similarity)
-        r_uj                                  (user u's actual rating on neighbor item j)
-        b_uj = mu + b_u + b_j                (baseline for the neighbor)
-        c    = SIM_DENOM_REG = 0.05           (denominator regularisation constant)
+        r_uj                                 (user u's actual rating on neighbor item j)
+        b_j                                  (neighbor item's bias)
+        c    = SIM_DENOM_REG                 (denominator regularisation constant)
 
-    The numerator weights each neighbour's baseline-deviation by its amplified
-    similarity, and the denominator normalises by total absolute similarity
-    plus a small constant to damp noisy predictions when few strong neighbours exist.
+    The baseline mu + b_u + b_i captures:
+        - Global rating tendency
+        - User's rating tendency (harsh vs generous)
+        - Item's popularity (good vs bad item)
+
+    The neighbour term adds deviations from the baseline, weighted by similarity.
 
     Top-K selection uses np.argpartition for O(N) complexity instead of a full
     O(N log N) sort.  Only positively-correlated neighbours are retained.
 
-    Fallback: if no positive neighbours exist, the ALS baseline b_ui is returned.
-    All predictions are clamped to [0.5, 5.0].
+    Fallback: if no positive neighbours exist, the baseline is returned.
+    All predictions are clamped to [MIN_RATING, MAX_RATING].
     """
     if n_users is None:
         n_users = len( user_biases )
@@ -194,9 +192,12 @@ def predict_ratings( test_data=None, similarity_matrix=None, user_biases=None,
     for uid, iid, _, ts in test_data:
         u_idx, i_idx = uid - 1, iid - 1
         user_rated = np.nonzero( rating_matrix[u_idx] )[0]
+        
+        # Baseline prediction: mu + b_u + b_i
         baseline = global_mean + user_biases[u_idx] + item_biases[i_idx]
 
         if user_rated.size == 0:
+            # Cold start: fallback to baseline
             prediction = baseline
         else:
             sims = similarity_matrix[i_idx][user_rated]
@@ -220,7 +221,7 @@ def predict_ratings( test_data=None, similarity_matrix=None, user_biases=None,
                 # Case amplification: sharpens contrast between strong/weak neighbours
                 amplified = np.sign( nbr_sims ) * np.abs( nbr_sims ) ** sim_amplification
 
-                # Deviation of each neighbour's rating from its ALS baseline
+                # Deviation of each neighbour's rating from its baseline (mu + b_u + b_j)
                 nbr_baselines = global_mean + user_biases[u_idx] + item_biases[nbr_items]
                 nbr_deviations = nbr_ratings - nbr_baselines
 
@@ -287,15 +288,16 @@ if __name__ == '__main__':
         train_fold = [train[i] for i in train_idx]
         val_fold = [train[i] for i in val_idx]
 
-        fold_ubiases, fold_sim, fold_ibiases, fold_gmean = train_model(
+        fold_ubiases, fold_ibiases, fold_sim, fold_gmean = train_model(
             train_data=train_fold, n_users=total_users, n_items=total_items
         )
 
         val_queries = [(uid, iid, None, ts) for uid, iid, _, ts in val_fold]
         val_preds = predict_ratings( test_data=val_queries, similarity_matrix=fold_sim,
-                                     user_biases=fold_ubiases, train_data=train_fold,
+                                     user_biases=fold_ubiases, item_biases=fold_ibiases,
+                                     train_data=train_fold,
                                      n_users=total_users, n_items=total_items,
-                                     item_biases=fold_ibiases, global_mean=fold_gmean )
+                                     global_mean=fold_gmean )
 
         actual = np.array( [e[2] for e in val_fold] )
         predicted = np.array( [e[2] for e in val_preds] )
@@ -310,11 +312,11 @@ if __name__ == '__main__':
 
     # ---- Final Model on Full Training Set ----
     logger.info( 'Training final model on complete training set...' )
-    user_biases, sim_matrix, item_biases, global_mean = train_model( train_data=train )
+    user_biases, item_biases, sim_matrix, global_mean = train_model( train_data=train )
 
     predictions = predict_ratings( test_data=test, similarity_matrix=sim_matrix,
-                                   user_biases=user_biases, train_data=train,
-                                   item_biases=item_biases, global_mean=global_mean )
+                                   user_biases=user_biases, item_biases=item_biases,
+                                   train_data=train, global_mean=global_mean )
 
     serialize_predictions( filepath='submission.csv', predictions=predictions )
     logger.info( 'Submission file saved successfully' )
