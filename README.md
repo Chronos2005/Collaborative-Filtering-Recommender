@@ -76,7 +76,7 @@ The hyperparameters were chosen by grid search with 5-fold cross-validation. The
 
 ```bash
 pip install numpy
-python source_code.py
+python recommender.py
 ```
 
 The script expects two CSV files in the working directory. Both are splits of MovieLens 100K:
@@ -94,7 +94,7 @@ The script will:
 ## Project structure
 
 ```
-source_code.py   # Loads data, trains the model, predicts, cross-validates and writes the CSV
+recommender.py   # Loads data, trains the model, predicts, cross-validates and writes the CSV
 ```
 
 The core is three functions:
